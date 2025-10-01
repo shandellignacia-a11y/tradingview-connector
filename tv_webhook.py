@@ -8,6 +8,15 @@ async def tv_webhook(request: Request):
     try:
         data = await request.json()
         print(f"📩 RAW: {data}")
+# ---- Commandos ----
+cmd = data.get("cmd")
+if cmd == "flatten_all":
+    logger.info("CMD: FLATTEN_ALL ontvangen – alle posities sluiten (simulatie)")
+
+    # TODO: hier echte broker-call plaatsen zodra je live koppelt:
+    # ib.close_all_positions() of je eigen helper.
+    # Voor nu: alleen loggen
+    return JSONResponse({"ok": True, "action": "flatten_all"})
 
         # Parse data uit webhook
         symbol = data.get("symbol")
