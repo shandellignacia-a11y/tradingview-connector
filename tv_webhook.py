@@ -1,48 +1,64 @@
-from fastapi import FastAPI, Request, HTTPException
-import json
-from typing import Optional
-from config import SHARED_TOKEN, TZ
-from router import route_signal
+from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-def token_ok(query: str) -> bool:
-    return True if not SHARED_TOKEN else (query == SHARED_TOKEN)
-
 @app.post("/tv-webhook")
-async def tv_webhook(request: Request, token: Optional[str] = None):
-    if not token_ok(token or ""):
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    raw = await request.body()
-    body_txt = (raw or b"").decode("utf-8", errors="ignore").strip()
-    ct = (request.headers.get("content-type") or "").lower()
-
-    if not body_txt:
-        # Geen body ontvangen (bv. Message in TV leeg)
-        print("⚠️ Empty POST body from", request.client, "content-type:", ct)
-        raise HTTPException(status_code=400, detail="Empty body. Set a JSON Message in your TradingView alert.")
-
-    # Probeer JSON te parsen; zo niet, geef nette fout terug
+async def tv_webhook(request: Request):
     try:
-        data = json.loads(body_txt)
-    except Exception:
-        print("⚠️ Non-JSON body:", body_txt[:200])
-        raise HTTPException(status_code=400, detail=f"Body is not valid JSON (content-type={ct}).")
+        # --- RAW input log ---
+        try:
+            raw = await request.body()
+            print(f"📥 RAW: {raw.decode('utf-8','ignore')}")
+        except Exception as _e:
+            print(f"📥 RAW: <unavailable> ({_e})")
 
-    print("📩 Webhook received:", data)
+        # JSON parsen
+        data = await request.json()
 
-    # Vereiste velden
-    symbol = str(data.get("symbol", "")).upper()
-    side   = str(data.get("side", "")).upper()
-    entry  = float(data.get("entry", 0.0))
-    if not symbol or side not in {"BUY","SELL"} or entry <= 0:
-        raise HTTPException(status_code=400, detail=f"Missing/invalid fields in JSON: {data}")
+        # --- Parsed log ---
+        print(
+            "[Webhook] Parsed:",
+            "symbol=", data.get("symbol"),
+            "side=",   data.get("side"),
+            "tf=",     data.get("tf"),
+            "entry=",  data.get("entry"),
+        )
 
-    # Optioneel
-    tp = data.get("tp"); sl = data.get("sl")
-    rr = float(data.get("rr", 2.0)); atr = data.get("atr")
-    venue = data.get("venue")
+        # Basis data
+        symbol = data.get("symbol")
+        side   = data.get("side")
+        entry  = float(data.get("entry", 0))
+        tf     = data.get("tf")
 
-    result = route_signal(symbol=symbol, side=side, entry=entry, venue=venue, tp=tp, sl=sl, rr=rr, atr=atr)
-    return result
+        # Order sizing en targets (voorbeeld!)
+        qty = max(1, int(10000 / entry))  # voorbeeld berekening
+        tp  = round(entry * 1.02, 3)
+        sl  = round(entry * 0.99, 3)
+
+        # --- Order prep log ---
+        print(f"🛠️ Order prep: symbol={symbol}, side={side}, qty={qty}, entry={entry}, tp={tp}, sl={sl}")
+
+        # TODO: hier zou je echte broker-functie komen
+        # bijv. ib.placeOrder(...) of bybit.place_order(...)
+        print(f"📡 Sending order → broker (simulatie): {side} {qty} {symbol} @ {entry}")
+
+        # Resultaat teruggeven
+        result = {
+            "ok": True,
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "venue": "IBKR"
+        }
+
+        # --- Response log ---
+        print(f"📤 Response: {result}")
+
+        return result
+
+    except Exception as e:
+        print(f"[Error] {e}")
+        return {"ok": False, "reason": str(e)}
