@@ -1,150 +1,193 @@
-# tv_webhook.py
-# FastAPI webhook die TradingView alerts omzet naar IBKR orders (via ib_insync).
-# Veilig / eenvoudig: MarketOrders, DAY. Optionele qty uit alert; anders DEFAULT_QTY.
-
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from ib_insync import IB, Stock, MarketOrder
 import os
-import asyncio
-from typing import Optional
-import time
+import json
+import logging
+from pathlib import Path
+from typing import Optional, Literal
 
-app = FastAPI()
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, Field, validator
+from ib_insync import IB, Stock, MarketOrder, util
 
-# ---- Config uit omgevingsvariabelen (met veilige defaults) ----
-IB_HOST       = os.getenv("IB_HOST", "127.0.0.1")     # zelfde machine als IB Gateway/TWS
-IB_PORT       = int(os.getenv("IB_PORT", "7497"))     # 7497 Paper, 7496/4002 Live
-IB_CLIENT_ID  = int(os.getenv("IB_CLIENT_ID", "1"))
-DEFAULT_QTY   = int(os.getenv("DEFAULT_QTY", "1"))
-PRIMARY_EXCH  = os.getenv("PRIMARY_EXCHANGE", "NASDAQ")  # hint voor contract
-CURRENCY      = os.getenv("CURRENCY", "USD")
+# =============== Config & Logging ===============
+from dotenv import load_dotenv
+load_dotenv()
 
-# Eenvoudige de-bouncer zodat we niet dubbel schieten binnen een paar seconden
-LAST_ORDER_TS = {}      # key: (symbol, side) -> epoch seconds
-ORDER_COOLDOWN_SEC = 5  # minimaal 5s tussen identieke signalen
+IB_HOST = os.getenv("IB_HOST", "127.0.0.1")
+IB_PORT = int(os.getenv("IB_PORT", "7497"))   # Paper: 7497, Live: 7496
+IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "19"))  # kies vrij ID
+DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "USD")
+ROUTING = os.getenv("ROUTING", "SMART")  # of "LSE" etc.
+REQUIRE_TOKEN = os.getenv("REQUIRE_TOKEN", "false").lower() == "true"
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "set-a-strong-token-if-required")
 
-ib = IB()
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "tv_webhook.log", encoding="utf-8")
+    ],
+)
+logger = logging.getLogger("tv_webhook")
 
-async def ensure_connected():
-    """Zorgt dat IB verbonden is (of wordt) en wacht kort op verbinding."""
-    if not ib.isConnected():
-        try:
-            await ib.connectAsync(IB_HOST, IB_PORT, IB_CLIENT_ID, timeout=5)
-        except Exception as e:
-            return False, f"IB connect failed: {e}"
-    return True, "connected"
+# =============== FastAPI ===============
+app = FastAPI(title="TradingView → IBKR Webhook", version="1.0.0")
 
-def _contract_for_symbol(symbol: str):
+# =============== Models ===============
+class TVAlert(BaseModel):
+    # Variant 1: trading signal
+    symbol: Optional[str] = Field(None, description="Ticker, bv. AAPL of AMS:ASML")
+    tf: Optional[str] = Field(None, description="TradingView {{interval}}")
+    side: Optional[Literal["BUY", "SELL"]] = None
+    entry: Optional[str] = None
+    qty: Optional[float] = Field(None, description="Aantal stuks")
+    # Variant 2: command
+    cmd: Optional[Literal["flatten_all"]] = None
+
+    @validator("qty")
+    def _qty_positive(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("qty must be > 0")
+        return v
+
+# =============== IBKR Client (lazy singleton) ===============
+_ib: Optional[IB] = None
+
+def get_ib() -> IB:
+    global _ib
+    if _ib is not None and _ib.isConnected():
+        return _ib
+    ib = IB()
+    logger.info(f"Connecting to IB @ {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID}) ...")
+    ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=5)
+    logger.info("Connected to IB.")
+    util.startLoop()  # ensure event loop integration if needed
+    _ib = ib
+    return _ib
+
+# =============== Helpers ===============
+def parse_symbol(symbol: str):
     """
-    Maak een SMART-route Stock contract. primaryExchange als hint voor routing/identify.
-    IBKR resolve’t dit naar de juiste venue.
+    Accepts 'AAPL' or 'NASDAQ:AAPL' or 'AMS:ASML'.
+    Returns (exchange, localSymbol).
     """
-    return Stock(symbol.upper(), 'SMART', CURRENCY, primaryExchange=PRIMARY_EXCH)
+    if ":" in symbol:
+        exch, local = symbol.split(":", 1)
+        return exch.upper(), local.upper()
+    return ROUTING, symbol.upper()
 
-async def place_market_order(symbol: str, side: str, qty: int):
-    """
-    Plaats een MarketOrder (DAY). side: 'BUY' of 'SELL'.
-    Wacht kort op fill/confirm, geef resultaat terug.
-    """
-    contract = _contract_for_symbol(symbol)
-    action = 'BUY' if side.upper() == 'BUY' else 'SELL'
-    order  = MarketOrder(action, qty)
-    trade  = ib.placeOrder(contract, order)
+def place_market_order(symbol: str, action: Literal["BUY", "SELL"], qty: float):
+    ib = get_ib()
+    exch, local = parse_symbol(symbol)
+    logger.info(f"Placing {action} {qty} {local} via {exch} ...")
 
-    # Wacht (kort) op status; niet blokkeren voor altijd
-    t0 = time.time()
-    while not trade.isDone():
-        await asyncio.sleep(0.25)
-        if time.time() - t0 > 8:  # 8 seconden max wachten
-            break
-    status = trade.orderStatus.status
+    contract = Stock(local, exchange=exch if exch != "SMART" else "SMART", currency=DEFAULT_CURRENCY)
+    ib.qualifyContracts(contract)
+    order = MarketOrder(action, qty)
+    trade = ib.placeOrder(contract, order)
+    logger.info(f"Submitted orderId={trade.order.orderId} status={trade.orderStatus.status}")
+    # Wait a tiny moment for status update (non-blocking friendly)
+    ib.sleep(0.2)
     return {
-        "symbol": symbol,
-        "side": action,
-        "qty": qty,
-        "status": status,
-        "filled": trade.orderStatus.filled,
-        "avgFillPrice": trade.orderStatus.avgFillPrice
+        "orderId": trade.order.orderId,
+        "status": trade.orderStatus.status,
+        "filled": trade.orderStatus.filled or 0.0,
+        "remaining": trade.orderStatus.remaining or qty,
+        "avgFillPrice": trade.orderStatus.avgFillPrice or 0.0,
+        "symbol": local,
+        "exchange": exch,
     }
 
-async def flatten_all_positions():
-    """
-    Sluit alle open posities met een MarketOrder (tegenovergestelde richting).
-    Geeft per positie het resultaat terug.
-    """
+def flatten_all_positions():
+    ib = get_ib()
+    ib.sleep(0.1)
+    positions = ib.positions()  # list of Position(account, contract, position, avgCost)
     results = []
-    positions = ib.positions()  # synchronously available in ib_insync
-    for pos in positions:
-        symbol = pos.contract.symbol
-        qty = abs(int(pos.position))
-        if qty == 0:
+    if not positions:
+        logger.info("No open positions to flatten.")
+        return {"flattened": 0, "details": []}
+
+    for p in positions:
+        pos = float(p.position)
+        if pos == 0:
             continue
-        side = 'SELL' if pos.position > 0 else 'BUY'
-        res = await place_market_order(symbol, side, qty)
-        results.append(res)
-    return results
+        local = p.contract.localSymbol or p.contract.symbol
+        exch = p.contract.primaryExchange or p.contract.exchange or ROUTING
+        action = "SELL" if pos > 0 else "BUY"
+        qty = abs(pos)
+        logger.info(f"Flattening {local} on {exch}: pos={pos} -> {action} {qty}")
+        # Ensure contract is tradable as Stock (fallback to symbol)
+        contract = Stock(local, exchange="SMART", currency=DEFAULT_CURRENCY)
+        ib.qualifyContracts(contract)
+        order = MarketOrder(action, qty)
+        trade = ib.placeOrder(contract, order)
+        ib.sleep(0.2)
+        results.append({
+            "symbol": local,
+            "action": action,
+            "qty": qty,
+            "orderId": trade.order.orderId,
+            "status": trade.orderStatus.status,
+        })
+
+    return {"flattened": len(results), "details": results}
+
+def ensure_auth(x_token: Optional[str]):
+    if REQUIRE_TOKEN and (not x_token or x_token != AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# =============== Routes ===============
+@app.get("/")
+def root():
+    return {"ok": True, "service": "TV→IBKR webhook", "version": "1.0.0"}
 
 @app.post("/tv-webhook")
-async def tv_webhook(request: Request):
-    # ---------- JSON ophalen ----------
+async def tv_webhook(
+    payload: TVAlert,
+    request: Request,
+    x_token: Optional[str] = Header(default=None, convert_underscores=False),
+):
+    ensure_auth(x_token)
+
+    # Raw body for logging
     try:
-        data = await request.json()
+        raw = await request.body()
+        logger.info(f"Incoming alert: {raw.decode('utf-8', 'ignore')}")
     except Exception:
-        return JSONResponse({"ok": False, "reason": "Invalid JSON"}, status_code=400)
+        pass
 
-    # Command mode?
-    cmd = (data.get("cmd") or "").lower().strip()
-    if cmd == "flatten_all":
-        ok, msg = await ensure_connected()
-        if not ok:
-            return JSONResponse({"ok": False, "reason": msg}, status_code=500)
-        results = await flatten_all_positions()
-        return JSONResponse({"ok": True, "action": "flatten_all", "results": results})
+    # Command path
+    if payload.cmd == "flatten_all":
+        try:
+            res = flatten_all_positions()
+            return {"ok": True, "mode": "cmd", "cmd": "flatten_all", "result": res}
+        except Exception as e:
+            logger.exception("Error in flatten_all")
+            raise HTTPException(status_code=500, detail=f"flatten_all failed: {e}")
 
-    # ---------- TradingView payload ----------
-    symbol: Optional[str] = data.get("symbol")
-    side:   Optional[str] = data.get("side")  # "BUY" / "SELL"
-    qty_in  = data.get("qty")                 # optioneel, als je dat meestuurt
-    entry   = data.get("entry")               # niet nodig voor MarketOrder, maar gelogd
-    tf      = data.get("tf")
-
-    # Validatie
-    if not symbol or side not in ("BUY", "SELL"):
-        return JSONResponse({"ok": False, "reason": "Missing or invalid symbol/side"}, status_code=400)
-
-    # Rate-limit identieke signalen kort
-    key = (symbol.upper(), side.upper())
-    now = time.time()
-    if key in LAST_ORDER_TS and (now - LAST_ORDER_TS[key]) < ORDER_COOLDOWN_SEC:
-        return JSONResponse({"ok": True, "skipped": "cooldown", "symbol": symbol, "side": side})
-
-    qty = None
-    try:
-        if qty_in is not None:
-            # vanuit TV kan qty als string/float komen
-            qty = int(float(qty_in))
-    except Exception:
-        qty = None
-    if not qty or qty <= 0:
-        qty = DEFAULT_QTY
-
-    # ---------- Verbinden & order sturen ----------
-    ok, msg = await ensure_connected()
-    if not ok:
-        return JSONResponse({"ok": False, "reason": msg}, status_code=500)
+    # Trade signal path
+    if not payload.symbol or not payload.side or not payload.qty:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required fields for trade signal: symbol, side, qty.",
+        )
 
     try:
-        result = await place_market_order(symbol, side, qty)
-        LAST_ORDER_TS[key] = now
-        return JSONResponse({
+        res = place_market_order(symbol=payload.symbol, action=payload.side, qty=float(payload.qty))
+        return {
             "ok": True,
-            "symbol": symbol,
-            "side": side,
-            "qty": qty,
-            "entryFromAlert": entry,
-            "tf": tf,
-            "ibResult": result
-        })
+            "mode": "signal",
+            "signal": {
+                "symbol": payload.symbol,
+                "side": payload.side,
+                "qty": float(payload.qty),
+                "tf": payload.tf,
+                "entry": payload.entry,
+            },
+            "ib": res,
+        }
     except Exception as e:
-        return JSONResponse({"ok": False, "reason": f"Order failed: {e}"}, status_code=500)
+        logger.exception("Error placing order")
+        raise HTTPException(status_code=500, detail=f"Order failed: {e}")
